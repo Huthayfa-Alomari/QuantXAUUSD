@@ -1,28 +1,3 @@
-//+------------------------------------------------------------------+
-//| PositionManager.mqh                                              |
-//| QUANT_XAUUSD_ENGINE - Position lifecycle management (spec 27)    |
-//|                                                                   |
-//| REPAIR PASS rewrite - this file now owns the full logical-trade   |
-//| lifecycle, not just partial/BE/trailing mechanics:                |
-//|                                                                   |
-//| 1. `PositionContext` (per repair spec) replaces the old thin      |
-//|    ManagedPositionState - it carries strategy attribution         |
-//|    (primary + full contributing ensemble), entry snapshot         |
-//|    (ATR/ADX/spread/score), and running MAE/MFE.                   |
-//| 2. MAE/MFE are now tracked for real, every tick, in both price    |
-//|    units and R multiples, and persist through partial closes.     |
-//| 3. Partial-close volume is floor-normalized and NEVER rounds up;  |
-//|    if a requested partial would leave an unclosable remainder     |
-//|    below the broker minimum, the manager closes the FULL          |
-//|    remaining position instead of stranding sub-minimum dust.      |
-//| 4. `ProcessDeal()` is the single place that turns 1..N broker     |
-//|    deals (entry + partials + final exit) into exactly ONE         |
-//|    `TradeResult` - partial deals update the context only; only    |
-//|    the deal that empties the position produces a TradeResult.     |
-//| 5. Exit reason is inferred from which stored level (original SL,  |
-//|    current/trailed SL, TP1, TP2) the closing price actually       |
-//|    matches, instead of always defaulting to EXIT_MANUAL.          |
-//+------------------------------------------------------------------+
 #ifndef QXE_POSITIONMANAGER_MQH
 #define QXE_POSITIONMANAGER_MQH
 
@@ -35,417 +10,303 @@
 
 struct PositionContext
   {
-   ulong             positionIdentifier;   // POSITION_TICKET / POSITION_IDENTIFIER - stable across partials
-
-   datetime          openTime;
-
-   SignalDirection   direction;
-   RegimeType        regime;
-
-   StrategyType      primaryStrategy;
-   string            contributingStrategies;
-   string            contributorEligibility;
-
-   double            entryPrice;
-   double            initialStop;
-   double            currentStopPrice;     // updated by break-even / trailing
-   double            takeProfit1;
-   double            takeProfit2;
-   double            initialRiskDistance;  // |entry - initialStop| in price units
-   double            initialRiskMoney;
-   double            initialVolume;
-
-   double            entryATR;
-   double            entryADX;
-   double            entrySpread;
-   double            entryScore;
-
-   // Architecture v2 telemetry additions.
-   MarketState       entryState;           // full point-in-time snapshot at entry (incl. meta-regime)
-   double            rawScore;
-   double            interactionModifier;
-   int               contributorCount;
-   string            interactionReason;
-
-   // Risk-integrity audit trail (mirrors RiskParameters at open time).
-   double            equityAtEntry;
-   double            requestedRiskPercent;
-   double            lossPerLotBrokerAtEntry;    // OrderCalcProfit()-based, the value actually used for sizing
-   double            lossPerLotTickModelAtEntry; // old tick_size/tick_value formula's result - diagnostic only
-
-   double            realizedProfit;       // accumulated profit from partial closes so far
-   double            closedVolume;
-
-   double            highestPriceSeen;
-   double            lowestPriceSeen;
-
-   double            mae;                  // price units, adverse
-   double            mfe;                  // price units, favorable
-
-   bool              tp1Taken;
-   bool              tp2Taken;
-   bool              breakEvenApplied;
-
-   ExitReason        pendingExitReason;    // set BEFORE a manager-initiated close (e.g. opposite signal); EXIT_NONE = infer from price
-
-   bool              active;
+   ulong positionTicket;
+   ulong positionIdentifier;
+   datetime openTime;
+   SignalDirection direction;
+   RegimeType regime;
+   StrategyType primaryStrategy;
+   string contributingStrategies;
+   string contributorEligibility;
+   double signalEntryPrice,sizingEntryPrice,entryPrice;
+   double initialStop,currentStopPrice,takeProfit1,takeProfit2;
+   double initialRiskDistance,initialRiskMoney,initialVolume;
+   double entryATR,entryADX,entrySpread,entryScore;
+   MarketState entryState;
+   double rawScore,interactionModifier;
+   double primarySignalScore,allowAggregateScore,confirmationScore,confirmationBonus,sessionBonus,volatilityBonus,entryQualityBonus;
+   int contributorCount;
+   string interactionReason;
+   EligibilityDecision primaryEligibilityDecision;
+   string primaryEligibilityReason;
+   double equityAtEntry,requestedRiskPercent,lossPerLotBrokerAtEntry,lossPerLotTickModelAtEntry,riskBudgetMoney;
+   double realizedProfit,closedVolume;
+   double highestPriceSeen,lowestPriceSeen,mae,mfe;
+   bool tp1Taken,tp2Taken,breakEvenApplied;
+   ExitReason pendingExitReason;
+   bool recovered;
+   bool active;
   };
 
 class CPositionManager
   {
 private:
-   CTradeExecutor    *m_executor;
-   CRiskEngine       *m_risk;
-   PositionContext   m_contexts[];
+   CTradeExecutor *m_executor;
+   CRiskEngine *m_risk;
+   PositionContext m_contexts[];
 
 public:
-   void              Init(CTradeExecutor *executor, CRiskEngine *risk)
+   void Init(CTradeExecutor *executor,CRiskEngine *risk)
+     { m_executor=executor; m_risk=risk; ArrayResize(m_contexts,0); }
+
+   void RecoverOpenPositions(string symbol,ulong magic)
      {
-      m_executor = executor;
-      m_risk = risk;
-      ArrayResize(m_contexts, 0);
-     }
-
-   // Call immediately after a position is successfully opened. This is
-   // the ONLY place a new trade is counted as "opened" (repair spec:
-   // daily trade counter must count opens, not exit deals).
-   void              RegisterOpen(ulong ticket, const TradeSetup &setup, const RiskParameters &risk,
-                                   double entryATR, double entryADX, double entrySpread,
-                                   const MarketState &entryState)
-     {
-      int n = ArraySize(m_contexts);
-      ArrayResize(m_contexts, n + 1);
-
-      m_contexts[n].positionIdentifier = ticket;
-      m_contexts[n].openTime = TimeCurrent();
-      m_contexts[n].direction = setup.direction;
-      m_contexts[n].regime = setup.regime;
-      m_contexts[n].primaryStrategy = setup.primaryStrategy;
-      m_contexts[n].contributingStrategies = setup.contributingStrategies;
-      m_contexts[n].contributorEligibility = setup.contributorEligibility;
-      m_contexts[n].entryPrice = setup.entry;
-      m_contexts[n].initialStop = setup.stopLoss;
-      m_contexts[n].currentStopPrice = setup.stopLoss;
-      m_contexts[n].takeProfit1 = setup.takeProfit1;
-      m_contexts[n].takeProfit2 = setup.takeProfit2;
-      m_contexts[n].initialRiskDistance = MathAbs(setup.entry - setup.stopLoss);
-      m_contexts[n].initialRiskMoney = risk.moneyAtRisk;
-      m_contexts[n].initialVolume = risk.lotSize;
-      m_contexts[n].entryATR = entryATR;
-      m_contexts[n].entryADX = entryADX;
-      m_contexts[n].entrySpread = entrySpread;
-      m_contexts[n].entryScore = setup.compositeScore;
-      m_contexts[n].entryState = entryState;
-      m_contexts[n].rawScore = setup.rawScore;
-      m_contexts[n].interactionModifier = setup.interactionModifier;
-      m_contexts[n].contributorCount = setup.contributorCount;
-      m_contexts[n].interactionReason = setup.interactionReason;
-      m_contexts[n].equityAtEntry = risk.equity;
-      m_contexts[n].requestedRiskPercent = risk.riskPercent;
-      m_contexts[n].lossPerLotBrokerAtEntry = risk.lossPerLotBroker;
-      m_contexts[n].lossPerLotTickModelAtEntry = risk.lossPerLotTickModel;
-      m_contexts[n].realizedProfit = 0.0;
-      m_contexts[n].closedVolume = 0.0;
-      m_contexts[n].highestPriceSeen = setup.entry;
-      m_contexts[n].lowestPriceSeen = setup.entry;
-      m_contexts[n].mae = 0.0;
-      m_contexts[n].mfe = 0.0;
-      m_contexts[n].tp1Taken = false;
-      m_contexts[n].tp2Taken = false;
-      m_contexts[n].breakEvenApplied = false;
-      m_contexts[n].pendingExitReason = EXIT_NONE;
-      m_contexts[n].active = true;
-
-      m_risk.RegisterTradeOpened();
-     }
-
-   // Marks the context so the NEXT close is attributed to a specific
-   // reason (e.g. opposite-signal reversal) instead of being inferred
-   // from price. Call this BEFORE issuing the close.
-   void              TagPendingExit(ulong ticket, ExitReason reason)
-     {
-      int idx = FindByTicket(ticket);
-      if(idx >= 0)
-         m_contexts[idx].pendingExitReason = reason;
-     }
-
-   // Call every tick for every open position belonging to this EA.
-   // Updates MAE/MFE unconditionally, then runs partial-close /
-   // break-even / trailing logic.
-   void              ManageAll(string symbol, double atrH1)
-     {
-      for(int i = ArraySize(m_contexts) - 1; i >= 0; i--)
+      for(int i=PositionsTotal()-1;i>=0;i--)
         {
-         if(!m_contexts[i].active)
-            continue;
-         if(!PositionSelectByTicket(m_contexts[i].positionIdentifier))
-            continue; // closed elsewhere - finalized via ProcessDeal(), not here
-         UpdateExcursion(m_contexts[i]);
-         ManageOne(m_contexts[i], symbol, atrH1);
+         ulong ticket=PositionGetTicket(i); if(ticket==0) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=symbol) continue;
+         if((ulong)PositionGetInteger(POSITION_MAGIC)!=magic) continue;
+         ulong identifier=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
+         if(FindByIdentifier(identifier)>=0) continue;
+
+         PositionContext ctx; ResetContext(ctx);
+         ctx.positionTicket=ticket; ctx.positionIdentifier=identifier;
+         ctx.openTime=(datetime)PositionGetInteger(POSITION_TIME);
+         ctx.direction=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)?SIGNAL_BUY:SIGNAL_SELL;
+         ctx.entryPrice=PositionGetDouble(POSITION_PRICE_OPEN);
+         ctx.signalEntryPrice=ctx.entryPrice; ctx.sizingEntryPrice=ctx.entryPrice;
+         ctx.currentStopPrice=PositionGetDouble(POSITION_SL);
+         ctx.initialStop=ctx.currentStopPrice;
+         ctx.takeProfit2=PositionGetDouble(POSITION_TP);
+         ctx.initialVolume=PositionGetDouble(POSITION_VOLUME);
+         ctx.highestPriceSeen=ctx.entryPrice; ctx.lowestPriceSeen=ctx.entryPrice;
+         ctx.primaryStrategy=STRAT_TREND_FOLLOWING;
+         ctx.contributingStrategies="RECOVERED_AFTER_RESTART";
+         ctx.contributorEligibility="RECOVERED";
+         ctx.recovered=true; ctx.active=true;
+
+         // Recover original opening SL/TP and volume when broker history exposes them.
+         if(identifier>0 && HistorySelectByPosition(identifier))
+           {
+            double inVol=0.0;
+            for(int d=0;d<HistoryDealsTotal();d++)
+              {
+               ulong deal=HistoryDealGetTicket(d); if(deal==0) continue;
+               long et=HistoryDealGetInteger(deal,DEAL_ENTRY);
+               if(et==DEAL_ENTRY_IN || et==DEAL_ENTRY_INOUT)
+                 {
+                  inVol+=HistoryDealGetDouble(deal,DEAL_VOLUME);
+                  double dsl=HistoryDealGetDouble(deal,DEAL_SL);
+                  double dtp=HistoryDealGetDouble(deal,DEAL_TP);
+                  if(dsl>0.0) ctx.initialStop=dsl;
+                  if(dtp>0.0 && ctx.takeProfit2<=0.0) ctx.takeProfit2=dtp;
+                 }
+              }
+            if(inVol>0.0) ctx.initialVolume=inVol;
+           }
+         ctx.initialRiskDistance=MathAbs(ctx.entryPrice-ctx.initialStop);
+         AppendContext(ctx);
+         g_Logger.Warn(StringFormat("[POSITION-RECOVERY] ticket=%I64u identifier=%I64u entry=%.5f initialSL=%.5f volume=%.4f attribution=RECOVERED_AFTER_RESTART",
+            ticket,identifier,ctx.entryPrice,ctx.initialStop,ctx.initialVolume));
         }
      }
 
-   // Called from OnTradeTransaction for every DEAL_ENTRY_OUT/OUT_BY deal
-   // belonging to this EA. Accumulates partials into the context; only
-   // when the position is confirmed fully closed does this produce a
-   // finalized TradeResult (repair spec: "one logical trade -> one
-   // TradeResult"). Returns true and fills `outResult` on final close.
-   bool              ProcessDeal(ulong positionTicket, double dealVolume, double dealProfit,
-                                  double dealPrice, datetime dealTime, bool positionStillOpen,
-                                  RegimeType regimeAtExit, TradeResult &outResult)
+   void RegisterOpen(ulong ticket,const TradeSetup &setup,const RiskParameters &risk,
+                     double entryATR,double entryADX,double entrySpread,const MarketState &entryState)
      {
-      int idx = FindByTicket(positionTicket);
-      if(idx < 0)
-         return false; // not one of our tracked contexts
-
-      m_contexts[idx].realizedProfit += dealProfit;
-      m_contexts[idx].closedVolume += dealVolume;
-
-      if(positionStillOpen)
-         return false; // partial - context updated, no TradeResult yet
-
-      // Final deal - the position is now fully closed.
-      outResult = BuildFinalResult(m_contexts[idx], dealPrice, dealTime, regimeAtExit);
-      m_risk.RegisterTradeClosed(outResult.profit);
-      RemoveContext(idx);
-      return true;
+      if(!PositionSelectByTicket(ticket))
+        { g_Logger.Error(StringFormat("RegisterOpen: position ticket %I64u not selectable",ticket)); return; }
+      PositionContext ctx; ResetContext(ctx);
+      ctx.positionTicket=ticket;
+      ctx.positionIdentifier=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
+      ctx.openTime=(datetime)PositionGetInteger(POSITION_TIME);
+      ctx.direction=setup.direction; ctx.regime=setup.regime; ctx.primaryStrategy=setup.primaryStrategy;
+      ctx.contributingStrategies=setup.contributingStrategies; ctx.contributorEligibility=setup.contributorEligibility;
+      ctx.signalEntryPrice=(risk.signalEntryPrice>0.0)?risk.signalEntryPrice:setup.entry;
+      ctx.sizingEntryPrice=(risk.sizingEntryPrice>0.0)?risk.sizingEntryPrice:ctx.signalEntryPrice;
+      ctx.entryPrice=PositionGetDouble(POSITION_PRICE_OPEN);
+      ctx.initialStop=setup.stopLoss; ctx.currentStopPrice=setup.stopLoss;
+      ctx.takeProfit1=setup.takeProfit1; ctx.takeProfit2=setup.takeProfit2;
+      ctx.initialRiskDistance=MathAbs(ctx.entryPrice-ctx.initialStop);
+      ctx.initialRiskMoney=risk.moneyAtRisk; ctx.initialVolume=PositionGetDouble(POSITION_VOLUME);
+      ctx.entryATR=entryATR; ctx.entryADX=entryADX; ctx.entrySpread=entrySpread; ctx.entryScore=setup.compositeScore;
+      ctx.entryState=entryState; ctx.rawScore=setup.rawScore; ctx.interactionModifier=setup.interactionModifier;
+      ctx.primarySignalScore=setup.primarySignalScore; ctx.allowAggregateScore=setup.allowAggregateScore; ctx.confirmationScore=setup.confirmationScore;
+      ctx.confirmationBonus=setup.confirmationBonus; ctx.sessionBonus=setup.sessionBonus; ctx.volatilityBonus=setup.volatilityBonus; ctx.entryQualityBonus=setup.entryQualityBonus;
+      ctx.contributorCount=setup.contributorCount; ctx.interactionReason=setup.interactionReason;
+      ctx.primaryEligibilityDecision=setup.primaryEligibilityDecision; ctx.primaryEligibilityReason=setup.primaryEligibilityReason;
+      ctx.equityAtEntry=risk.equity; ctx.requestedRiskPercent=risk.riskPercent;
+      ctx.lossPerLotBrokerAtEntry=risk.lossPerLotBroker; ctx.lossPerLotTickModelAtEntry=risk.lossPerLotTickModel; ctx.riskBudgetMoney=risk.riskBudgetMoney;
+      ctx.highestPriceSeen=ctx.entryPrice; ctx.lowestPriceSeen=ctx.entryPrice; ctx.active=true;
+      AppendContext(ctx); m_risk.RegisterTradeOpened();
      }
 
-   int               Count(void) const { return ArraySize(m_contexts); }
+   void TagPendingExit(ulong ticket,ExitReason reason)
+     { int idx=FindByTicket(ticket); if(idx>=0) m_contexts[idx].pendingExitReason=reason; }
+
+   void ManageAll(string symbol,double atrH1)
+     {
+      for(int i=ArraySize(m_contexts)-1;i>=0;i--)
+        {
+         if(!m_contexts[i].active) continue;
+         if(!RefreshTicketByIdentifier(m_contexts[i])) continue;
+         if(!PositionSelectByTicket(m_contexts[i].positionTicket)) continue;
+         UpdateExcursion(m_contexts[i],symbol);
+         ManageOne(m_contexts[i],symbol,atrH1);
+        }
+     }
+
+   bool ProcessDeal(ulong positionIdentifier,double dealVolume,double dealProfit,double dealPrice,datetime dealTime,
+                    bool positionStillOpen,RegimeType regimeAtExit,TradeResult &outResult)
+     {
+      int idx=FindByIdentifier(positionIdentifier); if(idx<0) return false;
+      m_contexts[idx].realizedProfit+=dealProfit; m_contexts[idx].closedVolume+=dealVolume;
+      if(positionStillOpen) { RefreshTicketByIdentifier(m_contexts[idx]); return false; }
+      outResult=BuildFinalResult(m_contexts[idx],dealPrice,dealTime,regimeAtExit);
+      AggregateHistory(positionIdentifier,outResult);
+      m_risk.RegisterTradeClosed(outResult.profit);
+      RemoveContext(idx); return true;
+     }
+
+   int Count(void) const { return ArraySize(m_contexts); }
 
 private:
-   int               FindByTicket(ulong ticket) const
+   void ResetContext(PositionContext &c)
      {
-      for(int i = 0; i < ArraySize(m_contexts); i++)
-         if(m_contexts[i].positionIdentifier == ticket && m_contexts[i].active)
-            return i;
-      return -1;
+      c.positionTicket=0;c.positionIdentifier=0;c.openTime=0;c.direction=SIGNAL_NONE;c.regime=REGIME_NO_TRADE;c.primaryStrategy=STRAT_TREND_FOLLOWING;
+      c.contributingStrategies="";c.contributorEligibility="";c.signalEntryPrice=0;c.sizingEntryPrice=0;c.entryPrice=0;c.initialStop=0;c.currentStopPrice=0;c.takeProfit1=0;c.takeProfit2=0;
+      c.initialRiskDistance=0;c.initialRiskMoney=0;c.initialVolume=0;c.entryATR=0;c.entryADX=0;c.entrySpread=0;c.entryScore=0;c.rawScore=0;c.interactionModifier=0;
+      c.primarySignalScore=0;c.allowAggregateScore=0;c.confirmationScore=0;c.confirmationBonus=0;c.sessionBonus=0;c.volatilityBonus=0;c.entryQualityBonus=0;c.contributorCount=0;c.interactionReason="";
+      c.primaryEligibilityDecision=ELIGIBILITY_ALLOW;c.primaryEligibilityReason="";c.equityAtEntry=0;c.requestedRiskPercent=0;c.lossPerLotBrokerAtEntry=0;c.lossPerLotTickModelAtEntry=0;c.riskBudgetMoney=0;
+      c.realizedProfit=0;c.closedVolume=0;c.highestPriceSeen=0;c.lowestPriceSeen=0;c.mae=0;c.mfe=0;c.tp1Taken=false;c.tp2Taken=false;c.breakEvenApplied=false;c.pendingExitReason=EXIT_NONE;c.recovered=false;c.active=false;
+     }
+   void AppendContext(const PositionContext &ctx) { int n=ArraySize(m_contexts);ArrayResize(m_contexts,n+1);m_contexts[n]=ctx; }
+   int FindByTicket(ulong ticket) const { for(int i=0;i<ArraySize(m_contexts);i++) if(m_contexts[i].active && m_contexts[i].positionTicket==ticket) return i; return -1; }
+   int FindByIdentifier(ulong id) const { for(int i=0;i<ArraySize(m_contexts);i++) if(m_contexts[i].active && m_contexts[i].positionIdentifier==id) return i; return -1; }
+
+   bool RefreshTicketByIdentifier(PositionContext &ctx)
+     {
+      if(ctx.positionTicket>0 && PositionSelectByTicket(ctx.positionTicket) && (ulong)PositionGetInteger(POSITION_IDENTIFIER)==ctx.positionIdentifier) return true;
+      for(int i=PositionsTotal()-1;i>=0;i--)
+        {
+         ulong t=PositionGetTicket(i); if(t==0) continue;
+         if((ulong)PositionGetInteger(POSITION_IDENTIFIER)==ctx.positionIdentifier) { ctx.positionTicket=t; return true; }
+        }
+      return false;
      }
 
-   void              UpdateExcursion(PositionContext &ctx)
+   void UpdateExcursion(PositionContext &ctx,string symbol)
      {
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double currentPrice = (ctx.direction == SIGNAL_BUY) ? bid : ask;
-
-      if(currentPrice > ctx.highestPriceSeen)
-         ctx.highestPriceSeen = currentPrice;
-      if(currentPrice < ctx.lowestPriceSeen)
-         ctx.lowestPriceSeen = currentPrice;
-
-      double adverse, favorable;
-      if(ctx.direction == SIGNAL_BUY)
-        {
-         adverse = ctx.entryPrice - ctx.lowestPriceSeen;
-         favorable = ctx.highestPriceSeen - ctx.entryPrice;
-        }
-      else
-        {
-         adverse = ctx.highestPriceSeen - ctx.entryPrice;
-         favorable = ctx.entryPrice - ctx.lowestPriceSeen;
-        }
-
-      ctx.mae = MathMax(ctx.mae, adverse);
-      ctx.mfe = MathMax(ctx.mfe, favorable);
+      double bid=SymbolInfoDouble(symbol,SYMBOL_BID),ask=SymbolInfoDouble(symbol,SYMBOL_ASK);
+      double currentPrice=(ctx.direction==SIGNAL_BUY)?bid:ask;
+      if(currentPrice>ctx.highestPriceSeen)ctx.highestPriceSeen=currentPrice;
+      if(currentPrice<ctx.lowestPriceSeen)ctx.lowestPriceSeen=currentPrice;
+      double adverse=0,favorable=0;
+      if(ctx.direction==SIGNAL_BUY){adverse=ctx.entryPrice-ctx.lowestPriceSeen;favorable=ctx.highestPriceSeen-ctx.entryPrice;}
+      else {adverse=ctx.highestPriceSeen-ctx.entryPrice;favorable=ctx.entryPrice-ctx.lowestPriceSeen;}
+      ctx.mae=MathMax(ctx.mae,adverse);ctx.mfe=MathMax(ctx.mfe,favorable);
      }
 
-   void              ManageOne(PositionContext &ctx, string symbol, double atrH1)
+   void ManageOne(PositionContext &ctx,string symbol,double atrH1)
      {
-      double currentPrice = (ctx.direction == SIGNAL_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID)
-                                                            : SymbolInfoDouble(symbol, SYMBOL_ASK);
-      double profitDistance = (ctx.direction == SIGNAL_BUY) ? (currentPrice - ctx.entryPrice)
-                                                              : (ctx.entryPrice - currentPrice);
-      if(ctx.initialRiskDistance <= QXE_EPS)
-         return;
-      double rMultiple = profitDistance / ctx.initialRiskDistance;
+      double currentPrice=(ctx.direction==SIGNAL_BUY)?SymbolInfoDouble(symbol,SYMBOL_BID):SymbolInfoDouble(symbol,SYMBOL_ASK);
+      if(ctx.initialRiskDistance<=QXE_EPS) return;
+      double profitDistance=(ctx.direction==SIGNAL_BUY)?currentPrice-ctx.entryPrice:ctx.entryPrice-currentPrice;
+      double rMultiple=profitDistance/ctx.initialRiskDistance;
+      double positionVolume=PositionGetDouble(POSITION_VOLUME),volMin=QXE_VolumeMin(symbol);
 
-      double positionVolume = PositionGetDouble(POSITION_VOLUME);
-      double volMin = QXE_VolumeMin(symbol);
-
-      // --- Partial close at TP1 / TP2 (volume-safe: never round a
-      //     partial UP, and never strand a sub-minimum remainder) ---
-      if(!ctx.tp1Taken && rMultiple >= InpTP1R)
+      if(!ctx.tp1Taken && rMultiple>=InpTP1R)
         {
-         double requested = positionVolume * (InpTP1Pct / 100.0);
-         ExecuteSafePartial(ctx, requested, positionVolume, volMin, symbol);
-         ctx.tp1Taken = true; // attempted once regardless of outcome - avoids retry spam
+         double requested=ctx.initialVolume*(InpTP1Pct/100.0);
+         int res=ExecuteSafePartial(ctx,requested,positionVolume,volMin,symbol);
+         if(res!=0) ctx.tp1Taken=true;
+         if(res==2) return;
         }
-      else if(ctx.tp1Taken && !ctx.tp2Taken && rMultiple >= InpTP2R)
+      else if(ctx.tp1Taken && !ctx.tp2Taken && rMultiple>=InpTP2R)
         {
-         double requested = positionVolume * (InpTP2Pct / (100.0 - InpTP1Pct));
-         ExecuteSafePartial(ctx, requested, positionVolume, volMin, symbol);
-         ctx.tp2Taken = true;
+         double requested=ctx.initialVolume*(InpTP2Pct/100.0);
+         requested=MathMin(requested,PositionGetDouble(POSITION_VOLUME));
+         int res=ExecuteSafePartial(ctx,requested,PositionGetDouble(POSITION_VOLUME),volMin,symbol);
+         if(res!=0) ctx.tp2Taken=true;
+         if(res==2) return;
         }
 
-      // --- Break-even ---
-      if(!ctx.breakEvenApplied && rMultiple >= InpBreakEvenTriggerR)
+      if(!ctx.breakEvenApplied && rMultiple>=InpBreakEvenTriggerR)
         {
-         double newStop = ctx.entryPrice;
-         double currentTp = PositionGetDouble(POSITION_TP);
-         if(m_executor.ModifyStops(ctx.positionIdentifier, newStop, currentTp))
-           {
-            ctx.breakEvenApplied = true;
-            ctx.currentStopPrice = newStop;
-           }
+         double point=QXE_SymbolPoint(symbol);
+         double buffer=InpBreakEvenBufferPoints*point;
+         double newStop=(ctx.direction==SIGNAL_BUY)?ctx.entryPrice+buffer:ctx.entryPrice-buffer;
+         double currentTp=PositionGetDouble(POSITION_TP);
+         if(m_executor.ModifyStops(ctx.positionTicket,newStop,currentTp)) {ctx.breakEvenApplied=true;ctx.currentStopPrice=newStop;}
         }
 
-      // --- Trailing stop (ATR-based, chandelier-style) ---
-      if(rMultiple >= InpMinProfitRForTrailing && atrH1 > QXE_EPS)
+      // Avoid BE and trailing competing on the exact same trigger tick.
+      if(rMultiple>InpMinProfitRForTrailing && atrH1>QXE_EPS)
         {
-         double currentStop = PositionGetDouble(POSITION_SL);
-         double trailDistance = atrH1 * InpTrailingATRMultiplier;
-         double candidateStop = (ctx.direction == SIGNAL_BUY) ? currentPrice - trailDistance
-                                                                : currentPrice + trailDistance;
-
-         bool improves = (ctx.direction == SIGNAL_BUY) ? (candidateStop > currentStop)
-                                                         : (candidateStop < currentStop || currentStop <= 0.0);
-         if(improves)
-           {
-            double currentTp = PositionGetDouble(POSITION_TP);
-            if(m_executor.ModifyStops(ctx.positionIdentifier, candidateStop, currentTp))
-               ctx.currentStopPrice = candidateStop;
-           }
+         double currentStop=PositionGetDouble(POSITION_SL),trailDistance=atrH1*InpTrailingATRMultiplier;
+         double candidate=(ctx.direction==SIGNAL_BUY)?currentPrice-trailDistance:currentPrice+trailDistance;
+         bool improves=(ctx.direction==SIGNAL_BUY)?candidate>currentStop:(candidate<currentStop || currentStop<=0.0);
+         if(improves && m_executor.ModifyStops(ctx.positionTicket,candidate,PositionGetDouble(POSITION_TP))) ctx.currentStopPrice=candidate;
         }
      }
 
-   // Floors the requested volume to the broker step; if that floored
-   // amount is below the minimum, skips the partial entirely; if the
-   // REMAINDER after this partial would fall below the minimum, closes
-   // the full remaining position now instead of stranding unclosable
-   // dust (repair spec: "PARTIAL CLOSE VOLUME").
-   void              ExecuteSafePartial(PositionContext &ctx, double requested, double positionVolume,
-                                         double volMin, string symbol)
+   // 0=failed/skipped, 1=partial executed, 2=full close issued.
+   int ExecuteSafePartial(PositionContext &ctx,double requested,double positionVolume,double volMin,string symbol)
      {
-      double floored = QXE_NormalizeVolume(symbol, requested);
-      if(floored <= 0.0)
-        {
-         g_Logger.Debug(StringFormat("Partial close skipped (ticket=%d): requested %.4f floors below broker minimum %.4f",
-                         ctx.positionIdentifier, requested, volMin));
-         return;
-        }
-
-      double remainder = positionVolume - floored;
-      if(remainder > QXE_EPS && remainder < volMin)
-        {
-         // Closing `floored` would strand a sub-minimum remainder -
-         // close the FULL position now instead (documented remainder-
-         // safe rule, never leaves an invalid dust position).
-         g_Logger.Info(StringFormat("Partial close (ticket=%d) would strand %.4f below min %.4f - closing full remainder instead",
-                        ctx.positionIdentifier, remainder, volMin));
-         m_executor.CloseFull(ctx.positionIdentifier);
-         return;
-        }
-
-      m_executor.ClosePartial(ctx.positionIdentifier, floored);
+      double floored=QXE_NormalizeVolume(symbol,requested); if(floored<=0.0) return 0;
+      double remainder=positionVolume-floored;
+      if(remainder>QXE_EPS && remainder<volMin) return m_executor.CloseFull(ctx.positionTicket)?2:0;
+      return m_executor.ClosePartial(ctx.positionTicket,floored)?1:0;
      }
 
-   TradeResult       BuildFinalResult(const PositionContext &ctx, double exitPrice, datetime exitTime, RegimeType regimeAtExit)
+   TradeResult BuildFinalResult(const PositionContext &ctx,double exitPrice,datetime exitTime,RegimeType regimeAtExit)
      {
       TradeResult tr;
-      tr.ticket = ctx.positionIdentifier;
-      tr.openTime = ctx.openTime;
-      tr.closeTime = exitTime;
-      tr.strategy = ctx.primaryStrategy;
-      tr.contributingStrategies = ctx.contributingStrategies;
-      tr.contributorEligibility = ctx.contributorEligibility;
-      tr.regime = ctx.regime;
-      tr.direction = ctx.direction;
-      tr.entry = ctx.entryPrice;
-      tr.stopLoss = ctx.initialStop;
-      tr.takeProfit = ctx.takeProfit2;
-      tr.lot = ctx.initialVolume;
-      tr.riskMoney = ctx.initialRiskMoney;
-      tr.score = ctx.entryScore;
-      tr.atrAtEntry = ctx.entryATR;
-      tr.adxAtEntry = ctx.entryADX;
-      tr.spreadAtEntry = ctx.entrySpread;
-      tr.session = QXE_CurrentSession();
-      tr.equityAtEntry = ctx.equityAtEntry;
-      tr.requestedRiskPercent = ctx.requestedRiskPercent;
-      tr.slDistancePriceAtEntry = ctx.initialRiskDistance;
-      tr.lossPerLotBrokerAtEntry = ctx.lossPerLotBrokerAtEntry;
-      tr.lossPerLotTickModelAtEntry = ctx.lossPerLotTickModelAtEntry;
-      tr.expectedLossAtSL = ctx.initialRiskMoney;
-      tr.exitPrice = exitPrice;
-      tr.profit = ctx.realizedProfit;
-
-      tr.rMultiple = (ctx.initialRiskMoney > QXE_EPS) ? ctx.realizedProfit / ctx.initialRiskMoney : 0.0;
-
-      tr.mae = ctx.mae;
-      tr.mfe = ctx.mfe;
-      tr.maeR = (ctx.initialRiskDistance > QXE_EPS) ? -(ctx.mae / ctx.initialRiskDistance) : 0.0;
-      tr.mfeR = (ctx.initialRiskDistance > QXE_EPS) ? (ctx.mfe / ctx.initialRiskDistance) : 0.0;
-      tr.holdingSeconds = (int)(exitTime - ctx.openTime);
-
-      tr.exitReason = InferExitReason(ctx, exitPrice);
-
-      // Architecture v2 telemetry.
-      tr.entryState = ctx.entryState;
-      tr.regimeAtExit = regimeAtExit;
-      tr.rawScore = ctx.rawScore;
-      tr.interactionModifier = ctx.interactionModifier;
-      tr.contributorCount = ctx.contributorCount;
-      tr.interactionReason = ctx.interactionReason;
-      tr.eligibilityDecision = ELIGIBILITY_ALLOW; // the primary strategy is always ALLOW-tier by construction (see ScoreEngine)
-      tr.eligibilityReason = "primary strategy passed both the base regime gate and the meta-regime eligibility gate";
-
-      // [RISK VIOLATION] check: a position that exits via its ORIGINAL
-      // stop loss (never trailed, never break-evened) should realize
-      // close to -1R. A large deviation means the actual loss did not
-      // match what the sizing math promised - flag it loudly rather
-      // than let it quietly pass through statistics.
-      if(tr.exitReason == EXIT_STOP_LOSS && ctx.initialRiskMoney > QXE_EPS)
-        {
-         double expectedR = -1.0;
-         double deviation = MathAbs(tr.rMultiple - expectedR);
-         if(deviation > 1.5) // more than 1.5R away from the expected -1R
-           {
-            g_Logger.Error(StringFormat(
-               "[RISK VIOLATION] ticket=%d equityAtEntry=%.2f reqRisk%%=%.4f expectedLossAtSL=%.2f actualPnL=%.2f actualR=%.2fR (expected ~-1R) lot=%.4f slDistPrice=%.5f lossPerLotBroker=%.5f lossPerLotTickModel=%.5f",
-               tr.ticket, ctx.equityAtEntry, ctx.requestedRiskPercent, ctx.initialRiskMoney, tr.profit, tr.rMultiple,
-               ctx.initialVolume, ctx.initialRiskDistance, ctx.lossPerLotBrokerAtEntry, ctx.lossPerLotTickModelAtEntry));
-           }
-        }
-
+      tr.ticket=ctx.positionTicket;tr.positionTicket=ctx.positionTicket;tr.positionIdentifier=ctx.positionIdentifier;tr.entryOrderTicket=0;tr.entryDealTicket=0;
+      tr.openTime=ctx.openTime;tr.closeTime=exitTime;tr.strategy=ctx.primaryStrategy;tr.contributingStrategies=ctx.contributingStrategies;tr.regime=ctx.regime;tr.direction=ctx.direction;
+      tr.entry=ctx.entryPrice;tr.signalEntry=ctx.signalEntryPrice;tr.sizingEntry=ctx.sizingEntryPrice;tr.fillEntry=ctx.entryPrice;
+      tr.signalToSizingDrift=MathAbs(ctx.sizingEntryPrice-ctx.signalEntryPrice);tr.sizingToFillSlippage=MathAbs(ctx.entryPrice-ctx.sizingEntryPrice);tr.totalEntryDrift=MathAbs(ctx.entryPrice-ctx.signalEntryPrice);
+      tr.stopLoss=ctx.initialStop;tr.takeProfit=ctx.takeProfit2;tr.lot=ctx.initialVolume;tr.riskMoney=ctx.initialRiskMoney;tr.riskBudgetMoney=ctx.riskBudgetMoney;tr.score=ctx.entryScore;
+      tr.atrAtEntry=ctx.entryATR;tr.adxAtEntry=ctx.entryADX;tr.spreadAtEntry=ctx.entrySpread;tr.session=ctx.entryState.session;
+      tr.equityAtEntry=ctx.equityAtEntry;tr.requestedRiskPercent=ctx.requestedRiskPercent;tr.slDistancePriceAtEntry=ctx.initialRiskDistance;
+      tr.lossPerLotBrokerAtEntry=ctx.lossPerLotBrokerAtEntry;tr.lossPerLotTickModelAtEntry=ctx.lossPerLotTickModelAtEntry;tr.expectedLossAtSL=ctx.initialRiskMoney;
+      tr.exitPrice=exitPrice;tr.grossProfit=0;tr.commission=0;tr.swap=0;tr.fees=0;tr.netProfit=ctx.realizedProfit;tr.profit=ctx.realizedProfit;
+      tr.rMultiple=(ctx.initialRiskMoney>QXE_EPS)?tr.profit/ctx.initialRiskMoney:0.0;
+      tr.mae=ctx.mae;tr.mfe=ctx.mfe;tr.maeR=(ctx.initialRiskDistance>QXE_EPS)?-(ctx.mae/ctx.initialRiskDistance):0.0;tr.mfeR=(ctx.initialRiskDistance>QXE_EPS)?ctx.mfe/ctx.initialRiskDistance:0.0;
+      tr.holdingSeconds=(int)(exitTime-ctx.openTime);tr.exitReason=InferExitReason(ctx,exitPrice);tr.brokerExitReason=0;
+      tr.entryState=ctx.entryState;tr.regimeAtExit=regimeAtExit;tr.rawScore=ctx.rawScore;tr.interactionModifier=ctx.interactionModifier;
+      tr.primarySignalScore=ctx.primarySignalScore;tr.allowAggregateScore=ctx.allowAggregateScore;tr.confirmationScore=ctx.confirmationScore;tr.confirmationBonus=ctx.confirmationBonus;
+      tr.sessionBonus=ctx.sessionBonus;tr.volatilityBonus=ctx.volatilityBonus;tr.entryQualityBonus=ctx.entryQualityBonus;
+      tr.contributorCount=ctx.contributorCount;tr.interactionReason=ctx.interactionReason;tr.contributorEligibility=ctx.contributorEligibility;
+      tr.eligibilityDecision=ctx.primaryEligibilityDecision;tr.eligibilityReason=ctx.primaryEligibilityReason;
       return tr;
      }
 
-   // Infers WHY a position closed by comparing the final exit price to
-   // the levels the manager itself set, instead of always defaulting to
-   // EXIT_MANUAL (repair spec: "EXIT REASON").
-   ExitReason        InferExitReason(const PositionContext &ctx, double exitPrice) const
+   void AggregateHistory(ulong identifier,TradeResult &tr)
      {
-      if(ctx.pendingExitReason != EXIT_NONE)
-         return ctx.pendingExitReason; // explicitly tagged by the caller (e.g. opposite signal)
-
-      double tolerance = MathMax(ctx.initialRiskDistance * 0.05, QXE_EPS * 10.0);
-
-      if(ctx.breakEvenApplied && MathAbs(exitPrice - ctx.entryPrice) <= tolerance)
-         return EXIT_BREAK_EVEN;
-
-      if(MathAbs(exitPrice - ctx.currentStopPrice) <= tolerance && ctx.currentStopPrice != ctx.initialStop)
-         return EXIT_TRAILING_STOP;
-
-      if(MathAbs(exitPrice - ctx.initialStop) <= tolerance)
-         return EXIT_STOP_LOSS;
-
-      if(MathAbs(exitPrice - ctx.takeProfit2) <= tolerance)
-         return ctx.tp2Taken ? EXIT_RUNNER : EXIT_TAKE_PROFIT_2;
-
-      if(MathAbs(exitPrice - ctx.takeProfit1) <= tolerance)
-         return EXIT_TAKE_PROFIT_1;
-
-      return EXIT_MANUAL; // genuinely could not match any known level
+      if(identifier==0 || !HistorySelectByPosition(identifier)) return;
+      double gp=0,comm=0,sw=0,fee=0; datetime latest=0;
+      for(int i=0;i<HistoryDealsTotal();i++)
+        {
+         ulong d=HistoryDealGetTicket(i);if(d==0)continue;
+         gp+=HistoryDealGetDouble(d,DEAL_PROFIT);comm+=HistoryDealGetDouble(d,DEAL_COMMISSION);sw+=HistoryDealGetDouble(d,DEAL_SWAP);fee+=HistoryDealGetDouble(d,DEAL_FEE);
+         long et=HistoryDealGetInteger(d,DEAL_ENTRY);datetime tm=(datetime)HistoryDealGetInteger(d,DEAL_TIME);
+         if((et==DEAL_ENTRY_OUT || et==DEAL_ENTRY_OUT_BY) && tm>=latest){latest=tm;tr.brokerExitReason=HistoryDealGetInteger(d,DEAL_REASON);tr.exitPrice=HistoryDealGetDouble(d,DEAL_PRICE);}
+         if((et==DEAL_ENTRY_IN || et==DEAL_ENTRY_INOUT) && tr.entryDealTicket==0) tr.entryDealTicket=d;
+        }
+      tr.grossProfit=gp;tr.commission=comm;tr.swap=sw;tr.fees=fee;tr.netProfit=gp+comm+sw+fee;tr.profit=tr.netProfit;
+      tr.rMultiple=(tr.riskMoney>QXE_EPS)?tr.netProfit/tr.riskMoney:0.0;
+      if(tr.exitReason==EXIT_STOP_LOSS && tr.riskMoney>QXE_EPS)
+        {
+         double deviation=MathAbs(tr.rMultiple+1.0);
+         if(deviation>0.60) g_Logger.Error(StringFormat("[RISK VIOLATION] identifier=%I64u expected~-1R actual=%.2fR net=%.2f",identifier,tr.rMultiple,tr.netProfit));
+         else if(deviation>0.30) g_Logger.Warn(StringFormat("[RISK WARNING] identifier=%I64u expected~-1R actual=%.2fR net=%.2f",identifier,tr.rMultiple,tr.netProfit));
+        }
      }
 
-   void              RemoveContext(int index)
+   ExitReason InferExitReason(const PositionContext &ctx,double exitPrice) const
      {
-      m_contexts[index].active = false;
-      int n = ArraySize(m_contexts);
-      for(int i = index; i < n - 1; i++)
-         m_contexts[i] = m_contexts[i + 1];
-      ArrayResize(m_contexts, n - 1);
+      if(ctx.pendingExitReason!=EXIT_NONE)return ctx.pendingExitReason;
+      double tol=MathMax(ctx.initialRiskDistance*0.05,QXE_EPS*10.0);
+      if(ctx.breakEvenApplied && MathAbs(exitPrice-ctx.currentStopPrice)<=tol) return EXIT_BREAK_EVEN;
+      if(MathAbs(exitPrice-ctx.currentStopPrice)<=tol && MathAbs(ctx.currentStopPrice-ctx.initialStop)>QXE_EPS) return EXIT_TRAILING_STOP;
+      if(MathAbs(exitPrice-ctx.initialStop)<=tol)return EXIT_STOP_LOSS;
+      if(MathAbs(exitPrice-ctx.takeProfit2)<=tol)return ctx.tp2Taken?EXIT_RUNNER:EXIT_TAKE_PROFIT_2;
+      if(MathAbs(exitPrice-ctx.takeProfit1)<=tol)return EXIT_TAKE_PROFIT_1;
+      return EXIT_MANUAL;
      }
+
+   void RemoveContext(int index){int n=ArraySize(m_contexts);for(int i=index;i<n-1;i++)m_contexts[i]=m_contexts[i+1];ArrayResize(m_contexts,n-1);}
   };
 
-#endif // QXE_POSITIONMANAGER_MQH
+#endif
