@@ -15,7 +15,7 @@ class CStrategyEligibilityEngine
 public:
    // Direction-aware eligibility decision.
    //
-   // Controlled multi-year research rules currently encoded:
+   // Controlled multi-year research rules (OPT-IN / default OFF):
    // 1) TSM + META_TREND_MATURE_BEAR + SELL  => BLOCK
    // 2) TSM + META_BREAKOUT_TRANSITION + BUY => BLOCK
    // 3) TSM + META_TREND_MATURE_BULL + SELL  => BLOCK
@@ -47,14 +47,14 @@ public:
       // ---------------------------------------------------------------
       // Controlled multi-year directional filters.
       //
-      // These rules intentionally apply ONLY to TimeSeriesMomentum and
-      // ONLY to the exact regime + direction combinations validated by
-      // the cleaned 2022-2026 telemetry dataset. No blanket directional
-      // ban is introduced.
+      // These rules apply ONLY to TimeSeriesMomentum and ONLY when the
+      // corresponding Config toggle is enabled. Default OFF prevents
+      // in-sample policy leakage into baseline/live behavior.
       // ---------------------------------------------------------------
       if(strategy == STRAT_TIME_SERIES_MOMENTUM)
         {
-         if(meta.regime == META_TREND_MATURE_BEAR &&
+         if(InpEligibility_TSM_BlockMatureBearSell &&
+            meta.regime == META_TREND_MATURE_BEAR &&
             direction == SIGNAL_SELL)
            {
             outReason =
@@ -62,7 +62,8 @@ public:
             return ELIGIBILITY_BLOCK;
            }
 
-         if(meta.regime == META_BREAKOUT_TRANSITION &&
+         if(InpEligibility_TSM_BlockBreakoutTransitionBuy &&
+            meta.regime == META_BREAKOUT_TRANSITION &&
             direction == SIGNAL_BUY)
            {
             outReason =
@@ -70,7 +71,8 @@ public:
             return ELIGIBILITY_BLOCK;
            }
 
-         if(meta.regime == META_TREND_MATURE_BULL &&
+         if(InpEligibility_TSM_BlockMatureBullSell &&
+            meta.regime == META_TREND_MATURE_BULL &&
             direction == SIGNAL_SELL)
            {
             outReason =

@@ -137,6 +137,15 @@ input string InpSectionV2="==== ARCHITECTURE V2 ====";
 input bool InpEnableEligibilityEngine=true;
 input bool InpAllowStandaloneStructureLiquidity=false;
 input bool InpEnableInteractionMatrix=true;
+// Research-derived eligibility rules: OPT-IN / default OFF.
+input bool InpEligibility_TSM_BlockMatureBearSell=false;
+input bool InpEligibility_TSM_BlockBreakoutTransitionBuy=false;
+input bool InpEligibility_TSM_BlockMatureBullSell=false;
+
+// Wick reversal stays shadow-only unless explicitly enabled.
+// Max=8 reproduces the prior v2.1 score cap when enabled.
+input bool InpEnableWickScoreBoost=false;
+input double InpWickMaxScoreBoost=8.0;
 input bool InpInteraction_MomentumStructure_Bonus=false;
 input double InpInteraction_MomentumStructure_BonusPts=8.0;
 input bool InpInteraction_MomentumVWAP_Penalty=false;

@@ -205,39 +205,29 @@ public:
                 (dir == SIGNAL_SELL && wick.bearish));
 
             if(wickAligned)
-  {
-   double baseScore = score;
+              {
+               double wickBoost = 0.0;
 
-   double wickBoost =
-      QXE_Clamp(3.0 + wick.quality * 0.05,
-                3.0,
-                8.0);
+               if(InpEnableWickScoreBoost && InpWickMaxScoreBoost > 0.0)
+                 {
+                  wickBoost =
+                     QXE_Clamp(3.0 + wick.quality * 0.05,
+                               0.0,
+                               InpWickMaxScoreBoost);
 
-   double finalScore =
-      QXE_Clamp(baseScore + wickBoost,
-                0.0,
-                100.0);
+                  score =
+                     QXE_Clamp(score + wickBoost,
+                               0.0,
+                               100.0);
+                 }
 
-   PrintFormat(
-      "[WICK-TELEMETRY] strategy=VWAP dir=%s regime=%s quality=%.1f baseScore=%.1f boost=%.1f finalScore=%.1f crossed70=%s",
-      (dir == SIGNAL_BUY ? "BUY" : "SELL"),
-      EnumToString(state.regime),
-      wick.quality,
-      baseScore,
-      wickBoost,
-      finalScore,
-      (baseScore < InpMinScore && finalScore >= InpMinScore) ? "YES" : "NO"
-   );
-
-   score = finalScore;
-
-   reason +=
-      StringFormat(
-         " + WickV2Range(q=%.1f,+%.1f)",
-         wick.quality,
-         wickBoost
-      );
-  }
+               reason +=
+                  StringFormat(
+                     " + WickV2Range(q=%.1f,+%.1f,%s)",
+                     wick.quality,
+                     wickBoost,
+                     InpEnableWickScoreBoost ? "BOOST_ON" : "SHADOW");
+              }
            }
         }
 
